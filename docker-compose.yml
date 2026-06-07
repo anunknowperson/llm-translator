@@ -1,0 +1,195 @@
+x-backend-image: &backend-build
+  context: .
+  dockerfile: backend/Dockerfile
+
+services:
+  # --- Reverse proxy: единая точка входа ---
+  proxy:
+    image: nginx:1.27-alpine
+    ports:
+      - "${PROXY_PORT:-80}:80"
+    environment:
+      RATE_LIMIT_RPM: ${RATE_LIMIT_RPM:-5}
+      # Встроенный механизм образа nginx: шаблоны из /etc/nginx/templates/*.template
+      # обрабатываются envsubst и кладутся в NGINX_ENVSUBST_OUTPUT_DIR; фильтр ограничивает
+      # подстановку только переменной RATE_LIMIT_RPM, не затрагивая $http_upgrade/$uri и т.п.
+      NGINX_ENVSUBST_OUTPUT_DIR: /etc/nginx
+      NGINX_ENVSUBST_FILTER: ^RATE_LIMIT_RPM$$
+    volumes:
+      - ./proxy/nginx.conf:/etc/nginx/templates/nginx.conf.template:ro
+    networks:
+      - frontend_net
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # --- Frontend (React + Mantine + Vite, собран статикой и отдаётся nginx) ---
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    networks:
+      - frontend_net
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # --- FastAPI backend ---
+  backend:
+    build: *backend-build
+    env_file: .env
+    networks:
+      - frontend_net
+      - backend_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vllm:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health').status==200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      replicas: 2
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  # --- Celery worker: тяжёлые задачи перевода вынесены из API-процесса ---
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    env_file: .env
+    networks:
+      - backend_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      vllm:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+    stop_grace_period: 60s
+    restart: unless-stopped
+
+  # --- vLLM: ML-сервис, отдаёт OpenAI-совместимый API. Запускается на CPU без квантизации
+  # (модель Qwen3.5-0.8B достаточно мала для инференса на CPU) ---
+  vllm:
+    image: vllm/vllm-openai-cpu:latest-x86_64
+    env_file: .env
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN}
+      VLLM_CPU_KVCACHE_SPACE: ${VLLM_CPU_KVCACHE_SPACE:-4}
+    command: >
+      --model ${MODEL_NAME}
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-8192}
+    # Требования официального CPU-образа vLLM
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - SYS_NICE
+    shm_size: "4g"
+    volumes:
+      - vllm_cache:/root/.cache/huggingface
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/v1/models || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 300s
+    restart: unless-stopped
+
+  # --- Postgres: хранение истории переводов ---
+  postgres:
+    image: postgres:16-alpine
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # --- Redis: брокер и backend для Celery ---
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+    networks:
+      - backend_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # --- Мониторинг ---
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - backend_net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    networks:
+      - backend_net
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+networks:
+  # frontend_net: Proxy <-> UI <-> API
+  frontend_net:
+    driver: bridge
+  # backend_net: API <-> Redis <-> Postgres <-> Celery <-> vLLM. UI и Proxy сюда не подключены.
+  backend_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  vllm_cache:
+  prometheus_data:
+  grafana_data:
